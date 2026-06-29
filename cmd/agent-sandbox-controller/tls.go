@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"time"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -294,5 +295,82 @@ func patchCRDs(ctx context.Context, c client.Client, caPEM []byte, serviceName, 
 		setupLog.Info("Successfully patched CRD with webhook configuration", "crd", name)
 	}
 
+	return nil
+}
+
+// ensureSandboxClaimMutatingWebhook creates (or updates) the
+// MutatingWebhookConfiguration that drives the SandboxClaimDefaulter — the
+// admission-time stamp of agents.x-k8s.io/webhook-first-observed-at that the
+// agent_sandbox_claim_startup_latency_ms histogram requires. There is no static
+// manifest for this configuration; the operator owns it the same way it owns the
+// CRD conversion webhook caBundle, so it is applied here with the generated CA.
+//
+// failurePolicy is Ignore: the stamp is pure observability, so a webhook outage
+// must degrade the metric (a skipped sample), never block SandboxClaim creation.
+func ensureSandboxClaimMutatingWebhook(ctx context.Context, c client.Client, caPEM []byte, serviceName, namespace string) error {
+	const (
+		configName  = "agent-sandbox-sandboxclaim-stamp"
+		webhookName = "sandboxclaim-stamp.extensions.agents.x-k8s.io"
+		// Path matches controller-runtime's generated mutate path for
+		// extensions.agents.x-k8s.io/v1beta1 SandboxClaim (dots -> dashes).
+		mutatePath = "/mutate-extensions-agents-x-k8s-io-v1beta1-sandboxclaim"
+	)
+
+	path := mutatePath
+	failurePolicy := admissionregistrationv1.Ignore
+	sideEffects := admissionregistrationv1.SideEffectClassNone
+	scope := admissionregistrationv1.NamespacedScope
+	reinvocation := admissionregistrationv1.NeverReinvocationPolicy
+	timeoutSeconds := int32(5)
+
+	webhooks := []admissionregistrationv1.MutatingWebhook{{
+		Name: webhookName,
+		ClientConfig: admissionregistrationv1.WebhookClientConfig{
+			Service: &admissionregistrationv1.ServiceReference{
+				Name:      serviceName,
+				Namespace: namespace,
+				Path:      &path,
+			},
+			CABundle: caPEM,
+		},
+		Rules: []admissionregistrationv1.RuleWithOperations{{
+			Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+			Rule: admissionregistrationv1.Rule{
+				APIGroups:   []string{"extensions.agents.x-k8s.io"},
+				APIVersions: []string{"v1beta1"},
+				Resources:   []string{"sandboxclaims"},
+				Scope:       &scope,
+			},
+		}},
+		FailurePolicy:           &failurePolicy,
+		SideEffects:             &sideEffects,
+		TimeoutSeconds:          &timeoutSeconds,
+		ReinvocationPolicy:      &reinvocation,
+		AdmissionReviewVersions: []string{"v1"},
+	}}
+
+	existing := &admissionregistrationv1.MutatingWebhookConfiguration{}
+	err := c.Get(ctx, types.NamespacedName{Name: configName}, existing)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			cfg := &admissionregistrationv1.MutatingWebhookConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: configName},
+				Webhooks:   webhooks,
+			}
+			if err := c.Create(ctx, cfg); err != nil {
+				return fmt.Errorf("failed to create MutatingWebhookConfiguration %s: %w", configName, err)
+			}
+			setupLog.Info("Created SandboxClaim mutating webhook configuration", "name", configName)
+			return nil
+		}
+		return fmt.Errorf("failed to get MutatingWebhookConfiguration %s: %w", configName, err)
+	}
+
+	original := existing.DeepCopy()
+	existing.Webhooks = webhooks
+	if err := c.Patch(ctx, existing, client.MergeFrom(original)); err != nil {
+		return fmt.Errorf("failed to patch MutatingWebhookConfiguration %s: %w", configName, err)
+	}
+	setupLog.Info("Updated SandboxClaim mutating webhook configuration", "name", configName)
 	return nil
 }

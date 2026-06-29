@@ -259,6 +259,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The SandboxClaim mutating webhook (admission-time TTFE stamp) only exists
+	// when the extensions API group is served. Its MutatingWebhookConfiguration
+	// has no static manifest, so the operator self-applies it here with the same
+	// CA bundle it injected into the CRD conversion configs above.
+	if extensions {
+		setupLog.Info("Ensuring SandboxClaim mutating webhook configuration")
+		if err := ensureSandboxClaimMutatingWebhook(ctx, tempClient, caPEM, webhookServiceName, webhookNamespace); err != nil {
+			setupLog.Error(err, "failed to ensure SandboxClaim mutating webhook configuration")
+			os.Exit(1)
+		}
+	}
+
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                  scheme,
 		Metrics:                 metricsOpts,
@@ -355,6 +367,7 @@ func main() {
 		}
 
 		if err = ctrl.NewWebhookManagedBy(mgr, &extensionsv1beta1.SandboxClaim{}).
+			WithDefaulter(&extensionscontrollers.SandboxClaimDefaulter{}).
 			Complete(); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "SandboxClaim")
 			os.Exit(1)
