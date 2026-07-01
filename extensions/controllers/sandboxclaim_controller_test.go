@@ -3531,16 +3531,20 @@ func TestSandboxClaimPreventsDuplicateAdoptionDuringCacheLag(t *testing.T) {
 
 	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: "test-claim", Namespace: "default"}}
 
-	// Run reconcile
-	_, err := reconciler.Reconcile(context.Background(), req)
-	expectedErr := "triggered adoption completion for sandbox adopted-sb, retry"
-	if err == nil {
-		t.Fatal("Expected reconcile to fail with cache lag error, but it succeeded")
-	} else if err.Error() != expectedErr {
-		t.Errorf("Expected error %q, got: %q", expectedErr, err.Error())
+	// Run reconcile. Adoption is triggered on this pass, but the sandbox is not yet
+	// observed as controlled by the claim (cache lag), so the reconcile must NOT finalize
+	// the claim and must requeue to try again. Post-#3641 the requeue is a bounded
+	// immediate requeue with a nil error (not an exponentially-rate-limited error), so
+	// the compounding backoff that exhausted e2e wait windows no longer occurs.
+	res, err := reconciler.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Expected reconcile to requeue without error during cache lag, got error: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Fatalf("Expected reconcile to schedule a bounded requeue during cache lag, got RequeueAfter=%v", res.RequeueAfter)
 	}
 
-	// Verify that the claim status was NOT updated with the sandbox name (due to error)
+	// Verify that the claim status was NOT updated with the sandbox name (adoption deferred)
 	updatedClaim := &extensionsv1beta1.SandboxClaim{}
 	if err := fakeClient.Get(context.Background(), types.NamespacedName{Name: "test-claim", Namespace: "default"}, updatedClaim); err != nil {
 		t.Fatalf("failed to get claim: %v", err)

@@ -69,6 +69,16 @@ var ErrSandboxNotOwned = errors.New("sandbox not owned by this claim")
 // ErrWarmPoolNotFound is a sentinel error indicating a SandboxWarmPool was not found.
 var ErrWarmPoolNotFound = errors.New("SandboxWarmPool not found")
 
+// errAdoptionTriggeredRetry signals that warm-pool adoption was just completed for a
+// sandbox and the claim must be requeued so a later pass observes the sandbox as
+// controlled by this claim once the informer cache converges. It is a sentinel (not a
+// generic error) so Reconcile can convert it into a bounded immediate requeue instead
+// of returning an error: an error would route through the exponential failure rate
+// limiter, and because the same retry recurs each pass until the cache catches up the
+// backoff compounds and, under concurrent claims, exhausts bounded e2e wait windows
+// (#3641).
+var errAdoptionTriggeredRetry = errors.New("triggered adoption completion, retry")
+
 var restrictedDomains = []string{"kubernetes.io", "k8s.io", "agents.x-k8s.io"}
 
 var ErrCrossNamespaceAdoption = errors.New("cross-namespace adoption forbidden")
@@ -287,6 +297,24 @@ func (r *SandboxClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// TODO: This 1-minute requeue creates a latency regression vs an immediate watch trigger.
 		// Consider adding a lightweight SandboxTemplate -> claims map watch to reconcile promptly.
 		requeueDelay := 1 * time.Minute
+		if result.RequeueAfter > 0 && result.RequeueAfter < requeueDelay {
+			requeueDelay = result.RequeueAfter
+		}
+		return ctrl.Result{RequeueAfter: requeueDelay}, nil
+	}
+
+	// Adoption was just triggered for a warm-pool sandbox. The sandbox is now patched
+	// to us, but the informer cache may still show the warm-pool owner. Requeue
+	// immediately with a bounded delay to let the cache converge, WITHOUT returning an
+	// error: returning an error would route through the exponential failure rate
+	// limiter, and because this same retry recurs on each pass until the cache catches
+	// up the backoff compounds (5ms*(2^k-1)) and, under concurrent claims, exhausts
+	// bounded e2e wait windows (#3641). Status is intentionally not finalized with the
+	// sandbox on this pass (sandbox is nil here), preserving the duplicate-adoption
+	// protection during cache lag.
+	if errors.Is(reconcileErr, errAdoptionTriggeredRetry) {
+		logger.V(1).Info("Adoption triggered; requeueing immediately to let cache converge", "claim", claim.Name, "error", reconcileErr)
+		requeueDelay := immediateRequeueDelay
 		if result.RequeueAfter > 0 && result.RequeueAfter < requeueDelay {
 			requeueDelay = result.RequeueAfter
 		}
@@ -1461,9 +1489,13 @@ func (r *SandboxClaimReconciler) getOrCreateSandbox(ctx context.Context, claim *
 								logger.Info("Successfully migrated legacy sandbox label to annotation during adoption completion", "claim", claim.Name)
 							}
 						}
-						// If succeeded, return error to retry so next reconcile sees it controlled by us!
-						logger.Info("Triggered adoption completion for sandbox, retry", "sandbox", sbName, "claim", claim.Name)
-						return nil, fmt.Errorf("triggered adoption completion for sandbox %s, retry", sbName)
+						// Adoption was completed in-place (completeAdoption patched our controllerRef
+						// and the Warm label). Signal a retry so a later pass observes the sandbox as
+						// controlled by us once the cache converges. Returned as a sentinel so
+						// Reconcile requeues immediately with a bounded delay rather than routing
+						// through the exponential failure rate limiter (#3641).
+						logger.Info("Triggered adoption completion for sandbox, requeueing", "sandbox", sbName, "claim", claim.Name)
+						return nil, fmt.Errorf("%w: sandbox %s", errAdoptionTriggeredRetry, sbName)
 					}
 				}
 			}
