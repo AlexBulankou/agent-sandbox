@@ -3239,3 +3239,99 @@ func TestSandboxReconcile_ConditionsDoNotAccumulate(t *testing.T) {
 	require.Len(t, got.Status.Conditions, 1,
 		"conditions slice must not grow across %d reconcile iterations — controller must upsert not append", iters)
 }
+
+// TestSandboxReconcile_ResumeClearsStaleSuspendedCondition guards the resume leg
+// of the suspend/resume lifecycle: a Sandbox that was suspended (Suspended=True)
+// and is then resumed (OperatingMode=Running) must not keep advertising
+// Suspended=True. computeSuspendedCondition returns nil once the sandbox is no
+// longer suspended, and meta.SetStatusCondition only upserts, so without an
+// explicit RemoveStatusCondition the stale Suspended condition survives resume
+// forever — leaving a fully-operational resumed Sandbox perpetually reporting
+// Suspended=True. This mirrors the Finished cleanup and the accumulate guard above.
+func TestSandboxReconcile_ResumeClearsStaleSuspendedCondition(t *testing.T) {
+	sbName := "resumed-sandbox"
+	sbNs := "default"
+	nameHash := NameHash(sbName)
+
+	// Running-mode sandbox that still carries a stale Suspended=True condition
+	// left over from a prior suspend leg.
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: sbName, Namespace: sbNs,
+			UID:        sandboxUID,
+			Generation: 2,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			OperatingMode: sandboxv1beta1.SandboxOperatingModeRunning,
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "c", Image: "img"}},
+					},
+				},
+			},
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{{
+				Type:               string(sandboxv1beta1.SandboxConditionSuspended),
+				Status:             metav1.ConditionTrue,
+				Reason:             sandboxv1beta1.SandboxReasonSuspendedPodTerminated,
+				Message:            "pod terminated",
+				ObservedGeneration: 1,
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: sbName, Namespace: sbNs,
+			Labels:          map[string]string{sandboxLabel: nameHash},
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sbName)},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "c", Image: "img"}},
+		},
+		Status: corev1.PodStatus{
+			Phase:  corev1.PodRunning,
+			PodIPs: []corev1.PodIP{{IP: "10.0.0.1"}},
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodReady,
+				Status: corev1.ConditionTrue,
+			}},
+		},
+	}
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: sbName, Namespace: sbNs,
+			Labels:          map[string]string{sandboxLabel: nameHash},
+			OwnerReferences: []metav1.OwnerReference{sandboxControllerRef(sbName)},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "None",
+			Selector:  map[string]string{sandboxLabel: nameHash},
+		},
+	}
+
+	fc := newFakeClient(sandbox, pod, svc)
+	r := &SandboxReconciler{
+		Client: fc,
+		Scheme: Scheme,
+		Tracer: asmetrics.NewNoOp(),
+	}
+
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: sbName, Namespace: sbNs}}
+
+	_, err := r.Reconcile(ctx, req)
+	require.NoError(t, err)
+
+	var got sandboxv1beta1.Sandbox
+	require.NoError(t, fc.Get(ctx, types.NamespacedName{Name: sbName, Namespace: sbNs}, &got))
+
+	assert.Nil(t, meta.FindStatusCondition(got.Status.Conditions, string(sandboxv1beta1.SandboxConditionSuspended)),
+		"a resumed (Running) Sandbox must not retain a stale Suspended condition")
+	assert.True(t, meta.IsStatusConditionTrue(got.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady)),
+		"a resumed Sandbox with a Running/Ready pod must report Ready=True")
+}

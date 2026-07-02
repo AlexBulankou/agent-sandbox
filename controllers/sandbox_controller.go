@@ -256,15 +256,30 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	// compute and set overall conditions
 	conditions := r.computeConditions(sandbox, allErrors, svc, pod)
 	hasFinished := false
+	hasSuspended := false
 	for _, condition := range conditions {
 		meta.SetStatusCondition(&sandbox.Status.Conditions, condition)
 		if condition.Type == string(sandboxv1beta1.SandboxConditionFinished) {
 			hasFinished = true
 		}
+		if condition.Type == string(sandboxv1beta1.SandboxConditionSuspended) {
+			hasSuspended = true
+		}
 	}
 
 	if !hasFinished {
 		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished))
+	}
+
+	// computeSuspendedCondition returns nil once the sandbox is no longer
+	// suspended (OperatingMode=Running), so a resumed Sandbox has no Suspended
+	// condition in the freshly-computed set. Because meta.SetStatusCondition only
+	// upserts, a stale Suspended=True left over from a prior suspend leg would
+	// otherwise persist forever, leaving a fully-operational resumed Sandbox
+	// perpetually advertising Suspended=True. Remove it explicitly, mirroring the
+	// Finished cleanup above.
+	if !hasSuspended {
+		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionSuspended))
 	}
 
 	return allErrors
