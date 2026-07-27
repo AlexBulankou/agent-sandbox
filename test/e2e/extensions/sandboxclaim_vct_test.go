@@ -147,8 +147,15 @@ func TestCreateSandboxClaimVolumeClaimTemplates(t *testing.T) {
 			template := createTemplateForVCT(t, tc, ns.Name, "vct-template", tcCase.policy, tcCase.templateVCTs)
 			warmPool := createWarmPoolForVCT(t, tc, ns.Name, "vct-warmpool", template.Name)
 
-			if tcCase.claimVCTs == nil && tcCase.expectedErrorReason == "" {
-				// Wait for the warm pool to populate at least one warm sandbox to support warm start
+			if tcCase.claimVCTs == nil || tcCase.expectedErrorReason != "" {
+				// Wait for the warm pool to populate at least one warm sandbox before
+				// creating the claim. For the warm-start adoption case (nil claim VCTs)
+				// this is a correctness precondition. For the rejection cases (non-empty
+				// expectedErrorReason) it drains the warm-sandbox provisioning work from
+				// the single-worker reconcile queue and guarantees the warm pool is
+				// present in the informer cache, so the claim's own reconcile settles its
+				// deterministic validation reason within the poll window instead of
+				// queueing behind provisioning under serial (--parallel=1) load.
 				sandboxWarmpoolID := types.NamespacedName{Namespace: ns.Name, Name: warmPool.Name}
 				require.NoError(t, tc.WaitForWarmPoolReady(t.Context(), sandboxWarmpoolID))
 			}
