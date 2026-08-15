@@ -267,7 +267,16 @@ type SandboxBlueprint struct {
 
 // SandboxSpec defines the desired state of Sandbox.
 // volumeClaimTemplates is immutable after creation.
+//
+// podTemplate.spec is immutable on a running Sandbox: the controller only honors it at
+// Pod-create time (reconcileExistingPod never patches the running Pod's spec), so a
+// post-create edit would silently diverge the Sandbox spec from its Pod. Reject it at
+// admission. Only the pod SPEC is frozen — podTemplate.metadata (labels/annotations)
+// stays mutable because controllers rewrite it on existing Sandboxes (warm-pool claim
+// adoption). The rule hangs at the SandboxSpec usage site — NOT the shared
+// SandboxBlueprint — so it binds ONLY Sandbox; SandboxTemplate stays editable.
 // +kubebuilder:validation:XValidation:rule="has(self.volumeClaimTemplates) == has(oldSelf.volumeClaimTemplates) && (!has(self.volumeClaimTemplates) || self.volumeClaimTemplates == oldSelf.volumeClaimTemplates)",message="volumeClaimTemplates is immutable"
+// +kubebuilder:validation:XValidation:rule="self.podTemplate.spec == oldSelf.podTemplate.spec",message="podTemplate.spec is immutable"
 type SandboxSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html

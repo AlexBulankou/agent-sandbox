@@ -3966,6 +3966,8 @@ spec:
               rule: has(self.volumeClaimTemplates) == has(oldSelf.volumeClaimTemplates)
                 && (!has(self.volumeClaimTemplates) || self.volumeClaimTemplates ==
                 oldSelf.volumeClaimTemplates)
+            - message: podTemplate.spec is immutable
+              rule: self.podTemplate.spec == oldSelf.podTemplate.spec
           status:
             properties:
               conditions:
